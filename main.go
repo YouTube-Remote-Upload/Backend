@@ -1,172 +1,31 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
-	"github.com/manifoldco/promptui"
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
 	"google.golang.org/api/youtube/v3"
 )
 
-func main() {
-	ctx := context.Background()
-
-	// Load the client_secret.json file
-	b, err := os.ReadFile("client_secret.json")
-	if err != nil {
-		log.Fatalf("error reading client_secret.json file: %v", err)
-	}
-
-	// Configure OAuth2
-	config, err := google.ConfigFromJSON(b, youtube.YoutubeScope)
-	if err != nil {
-		log.Fatalf("error configuring OAuth2: %v", err)
-	}
-
-	// Get the authenticated OAuth2 client
-	client := getClient(ctx, config)
-
-	// Create a YouTube service
-	service, err := youtube.NewService(ctx, option.WithHTTPClient(client))
-	if err != nil {
-		log.Fatalf("error creating YouTube service: %v", err)
-	}
-
-	// Get video URL from user input
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("Enter the video URL: ")
-	videoURL, _ := reader.ReadString('\n')
-	videoURL = strings.TrimSpace(videoURL)
-	videoPath := "downloaded_video.mp4"
-
-	// Get video title from user input
-	fmt.Print("Enter the video title: ")
-	title, _ := reader.ReadString('\n')
-	title = strings.TrimSpace(title)
-
-	// Get video description from user input
-	fmt.Print("Enter the video description: ")
-	description, _ := reader.ReadString('\n')
-	description = strings.TrimSpace(description)
-
-	// Get video tags from user input
-	fmt.Print("Enter the video tags (comma separated): ")
-	tagsInput, _ := reader.ReadString('\n')
-	tags := strings.Split(strings.TrimSpace(tagsInput), ",")
-
-	// Get privacy status from user input
-	prompt := promptui.Select{
-		Label: "Select Privacy Status",
-		Items: []string{"public", "private", "unlisted"},
-	}
-	_, privacyStatus, err := prompt.Run()
-	if err != nil {
-		log.Fatalf("error selecting privacy status: %v", err)
-	}
-
-	// Download the video from the URL
-	err = downloadVideo(videoURL, videoPath)
-	if err != nil {
-		log.Fatalf("error downloading video: %v", err)
-	}
-	defer os.Remove(videoPath) // Delete the video after upload
-
-	// Upload the video to YouTube with progress tracking
-	err = uploadVideoWithProgress(service, videoPath, title, description, tags, privacyStatus)
-	if err != nil {
-		log.Fatalf("error uploading video: %v", err)
-	}
-
-	fmt.Println("\nVideo uploaded successfully!")
+type UploadRequest struct {
+	VideoURL      string   `json:"video_url" binding:"required"`
+	Title         string   `json:"title" binding:"required"`
+	Description   string   `json:"description" binding:"required"`
+	Tags          []string `json:"tags"`
+	PrivacyStatus string   `json:"privacy_status" binding:"required"`
 }
 
-// downloadVideo downloads a video from a URL
-func downloadVideo(videoURL, outputPath string) error {
-	resp, err := http.Get(videoURL)
-	if err != nil {
-		return fmt.Errorf("error making HTTP request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("error downloading: status %d", resp.StatusCode)
-	}
-
-	file, err := os.Create(outputPath)
-	if err != nil {
-		return fmt.Errorf("error creating file: %v", err)
-	}
-	defer file.Close()
-
-	_, err = io.Copy(file, resp.Body)
-	if err != nil {
-		return fmt.Errorf("error writing file: %v", err)
-	}
-
-	fmt.Println("Download completed:", outputPath)
-	return nil
-}
-
-// uploadVideoWithProgress uploads a video to YouTube and displays the progress
-func uploadVideoWithProgress(service *youtube.Service, filePath, title, description string, tags []string, privacyStatus string) error {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return fmt.Errorf("error opening file: %v", err)
-	}
-	defer file.Close()
-
-	// Get the file size for progress tracking
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("error getting file info: %v", err)
-	}
-	fileSize := fileInfo.Size()
-
-	// Create a metadata object for the video
-	video := &youtube.Video{
-		Snippet: &youtube.VideoSnippet{
-			Title:       title,
-			Description: description,
-			Tags:        tags,
-		},
-		Status: &youtube.VideoStatus{
-			PrivacyStatus: privacyStatus, // Choose between "public", "private", "unlisted"
-		},
-	}
-
-	// Manual progress tracking
-	progressReader := &ProgressReader{
-		Reader: file,
-		Total:  fileSize,
-	}
-	progressReader.Start()
-
-	// Upload the video
-	call := service.Videos.Insert([]string{"snippet", "status"}, video)
-	call = call.Media(progressReader)
-
-	_, err = call.Do()
-	progressReader.Stop()
-	if err != nil {
-		return fmt.Errorf("error uploading video: %v", err)
-	}
-
-	return nil
-}
-
-// ProgressReader allows tracking progress during reading
 type ProgressReader struct {
 	Reader   io.Reader
 	Total    int64
@@ -195,53 +54,187 @@ func (pr *ProgressReader) printProgress() {
 	fmt.Printf("\rProgress: %.2f%% (%d/%d bytes)", percent, pr.Uploaded, pr.Total)
 }
 
-// getClient handles the OAuth2 process
+func main() {
+	r := gin.Default()
+
+	// CORS Middleware
+	r.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{os.Getenv("URL_FRONTEND")},
+		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}))
+
+	r.POST("/upload", uploadHandler)
+	r.GET("/oauth/callback", oauthCallbackHandler)
+
+	r.Run(":8080") // Run the server
+}
+
+func uploadHandler(c *gin.Context) {
+	var req UploadRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx := context.Background()
+
+	// Load OAuth2 configuration
+	b, err := os.ReadFile("client_secret.json")
+	if err != nil {
+		log.Fatalf("error reading client_secret.json file: %v", err)
+	}
+
+	config, err := google.ConfigFromJSON(b, youtube.YoutubeScope)
+	if err != nil {
+		log.Fatalf("error configuring OAuth2: %v", err)
+	}
+
+	tokFile := "token.json"
+	if _, err := os.Stat(tokFile); os.IsNotExist(err) {
+		// If the token.json file does not exist, return the authorization link
+		authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":    "OAuth token not found.",
+			"auth_url": authURL,
+		})
+		return
+	}
+
+	// Use the existing token to continue the process
+	client := getClient(ctx, config)
+	service, err := youtube.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create YouTube service"})
+		return
+	}
+
+	// Download and upload the video
+	videoPath := "downloaded_video.mp4"
+	if err := downloadVideo(req.VideoURL, videoPath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to download video: %v", err)})
+		return
+	}
+	defer os.Remove(videoPath)
+
+	if err := uploadVideoWithProgress(service, videoPath, req.Title, req.Description, req.Tags, req.PrivacyStatus); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to upload video: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Video uploaded successfully!"})
+}
+
+func oauthCallbackHandler(c *gin.Context) {
+	code := c.Query("code")
+	if code == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing authorization code"})
+		return
+	}
+
+	ctx := context.Background()
+	b, err := os.ReadFile("client_secret.json")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read client_secret.json"})
+		return
+	}
+
+	config, err := google.ConfigFromJSON(b, youtube.YoutubeScope)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse OAuth config"})
+		return
+	}
+
+	tok, err := config.Exchange(ctx, code)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to exchange code for token"})
+		return
+	}
+
+	saveToken("token.json", tok)
+	c.JSON(http.StatusOK, gin.H{"message": "Authorization successful"})
+}
+
+func downloadVideo(videoURL, outputPath string) error {
+	resp, err := http.Get(videoURL)
+	if err != nil {
+		return fmt.Errorf("error making HTTP request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("error downloading: status %d", resp.StatusCode)
+	}
+
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("error creating file: %v", err)
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, resp.Body)
+	if err != nil {
+		return fmt.Errorf("error writing file: %v", err)
+	}
+
+	fmt.Println("Download completed:", outputPath)
+	return nil
+}
+
+func uploadVideoWithProgress(service *youtube.Service, filePath, title, description string, tags []string, privacyStatus string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("error opening file: %v", err)
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("error getting file info: %v", err)
+	}
+	fileSize := fileInfo.Size()
+
+	video := &youtube.Video{
+		Snippet: &youtube.VideoSnippet{
+			Title:       title,
+			Description: description,
+			Tags:        tags,
+		},
+		Status: &youtube.VideoStatus{
+			PrivacyStatus: privacyStatus,
+		},
+	}
+
+	progressReader := &ProgressReader{
+		Reader: file,
+		Total:  fileSize,
+	}
+	progressReader.Start()
+
+	call := service.Videos.Insert([]string{"snippet", "status"}, video)
+	call = call.Media(progressReader)
+
+	_, err = call.Do()
+	progressReader.Stop()
+	if err != nil {
+		return fmt.Errorf("error uploading video: %v", err)
+	}
+
+	return nil
+}
+
 func getClient(ctx context.Context, config *oauth2.Config) *http.Client {
 	tokFile := "token.json"
 	tok, err := tokenFromFile(tokFile)
 	if err != nil {
-		tok = getTokenFromWeb(config)
-		saveToken(tokFile, tok)
+		tok = nil
 	}
 	return config.Client(ctx, tok)
 }
 
-// getTokenFromWeb sets up a local server to capture the authorization code
-func getTokenFromWeb(config *oauth2.Config) *oauth2.Token {
-	// Set up a local server
-	listener, err := net.Listen("tcp", "localhost:8080")
-	if err != nil {
-		log.Fatalf("error setting up local server: %v", err)
-	}
-	defer listener.Close()
-
-	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-	fmt.Printf("Visit this link in your browser to authorize access:\n%v\n", authURL)
-
-	codeCh := make(chan string)
-
-	go func() {
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			code := r.URL.Query().Get("code")
-			if code != "" {
-				fmt.Fprintf(w, "Authorization received. You can close this page.")
-				codeCh <- code
-			} else {
-				http.Error(w, "missing authorization code", http.StatusBadRequest)
-			}
-		})
-		http.Serve(listener, nil)
-	}()
-
-	code := <-codeCh
-	tok, err := config.Exchange(context.Background(), code)
-	if err != nil {
-		log.Fatalf("error exchanging authorization code: %v", err)
-	}
-	return tok
-}
-
-// tokenFromFile reads an OAuth2 token from a file
 func tokenFromFile(file string) (*oauth2.Token, error) {
 	f, err := os.Open(file)
 	if err != nil {
@@ -253,7 +246,6 @@ func tokenFromFile(file string) (*oauth2.Token, error) {
 	return tok, err
 }
 
-// saveToken saves an OAuth2 token to a file
 func saveToken(path string, token *oauth2.Token) {
 	fmt.Printf("Saving token to %s\n", path)
 	f, err := os.Create(path)
