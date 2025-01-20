@@ -2,21 +2,26 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
+	"cloud.google.com/go/firestore"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v4"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
 	"google.golang.org/api/youtube/v3"
 )
+
+var jwtSecret = []byte(os.Getenv("JWT_SECRET"))
+var firebaseApp *firestore.Client
 
 type UploadRequest struct {
 	VideoURL      string   `json:"video_url" binding:"required"`
@@ -26,116 +31,69 @@ type UploadRequest struct {
 	PrivacyStatus string   `json:"privacy_status" binding:"required"`
 }
 
-type ProgressReader struct {
-	Reader   io.Reader
-	Total    int64
-	Uploaded int64
-	StartAt  time.Time
-}
-
-func (pr *ProgressReader) Read(p []byte) (int, error) {
-	n, err := pr.Reader.Read(p)
-	pr.Uploaded += int64(n)
-	pr.printProgress()
-	return n, err
-}
-
-func (pr *ProgressReader) Start() {
-	pr.StartAt = time.Now()
-	fmt.Println("Starting upload...")
-}
-
-func (pr *ProgressReader) Stop() {
-	fmt.Println("\nUpload completed.")
-}
-
-func (pr *ProgressReader) printProgress() {
-	percent := float64(pr.Uploaded) / float64(pr.Total) * 100
-	fmt.Printf("\rProgress: %.2f%% (%d/%d bytes)", percent, pr.Uploaded, pr.Total)
-}
-
 func main() {
+	initializeFirebase()
+
 	r := gin.Default()
 
-	// CORS Middleware
+	// Middleware CORS
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{os.Getenv("URL_FRONTEND")},
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowOrigins:     []string{os.Getenv("CORS_ALLOW_ORIGIN")},
+		AllowMethods:     []string{"GET", "POST", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
-		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}))
 
-	r.POST("/upload", uploadHandler)
+	r.GET("/login", loginHandler)
 	r.GET("/oauth/callback", oauthCallbackHandler)
+	r.GET("/refresh", refreshJWTHandler)
 
-	r.Run(":8080") // Run the server
-}
-
-func uploadHandler(c *gin.Context) {
-	var req UploadRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+	authorized := r.Group("/")
+	authorized.Use(authMiddleware())
+	{
+		authorized.POST("/upload", uploadHandler)
 	}
 
-	ctx := context.Background()
+	r.Run(":8080")
+}
 
-	// Load OAuth2 configuration
+func initializeFirebase() {
+	ctx := context.Background()
+	client, err := firestore.NewClient(ctx, "upload-123ea", option.WithCredentialsFile("serviceAccountKey.json"))
+	if err != nil {
+		log.Fatalf("Failed to initialize Firebase: %v", err)
+	}
+	firebaseApp = client
+	log.Println("Firebase initialized successfully!")
+}
+
+func loginHandler(c *gin.Context) {
 	b, err := os.ReadFile("client_secret.json")
 	if err != nil {
-		log.Fatalf("error reading client_secret.json file: %v", err)
+		log.Fatalf("Error reading client_secret.json file: %v", err)
 	}
 
 	config, err := google.ConfigFromJSON(b, youtube.YoutubeScope)
 	if err != nil {
-		log.Fatalf("error configuring OAuth2: %v", err)
+		log.Fatalf("Error configuring OAuth2: %v", err)
 	}
 
-	tokFile := "token.json"
-	if _, err := os.Stat(tokFile); os.IsNotExist(err) {
-		// If the token.json file does not exist, return the authorization link
-		authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error":    "OAuth token not found.",
-			"auth_url": authURL,
-		})
-		return
-	}
-
-	// Use the existing token to continue the process
-	client := getClient(ctx, config)
-	service, err := youtube.NewService(ctx, option.WithHTTPClient(client))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create YouTube service"})
-		return
-	}
-
-	// Download and upload the video
-	videoPath := "downloaded_video.mp4"
-	if err := downloadVideo(req.VideoURL, videoPath); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to download video: %v", err)})
-		return
-	}
-	defer os.Remove(videoPath)
-
-	if err := uploadVideoWithProgress(service, videoPath, req.Title, req.Description, req.Tags, req.PrivacyStatus); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to upload video: %v", err)})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "Video uploaded successfully!"})
+	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
+	c.Redirect(http.StatusFound, authURL)
 }
 
-func oauthCallbackHandler(c *gin.Context) {
-	code := c.Query("code")
-	if code == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing authorization code"})
+func refreshJWTHandler(c *gin.Context) {
+	userID := c.GetString("user_id") // Obtained via middleware or JWT parsing
+
+	// Retrieve the OAuth token from Firestore
+	token, err := getTokenFromFirestore(userID)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
 		return
 	}
 
-	ctx := context.Background()
+	// Check if the refresh_token is still valid and renew if necessary
 	b, err := os.ReadFile("client_secret.json")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read client_secret.json"})
@@ -148,110 +106,276 @@ func oauthCallbackHandler(c *gin.Context) {
 		return
 	}
 
+	tokenSource := config.TokenSource(context.Background(), token)
+	newToken, err := tokenSource.Token()
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Failed to refresh access token"})
+		return
+	}
+
+	// Update Firestore with the new token
+	if err := saveTokenToFirestore(userID, newToken); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update token in Firestore"})
+		return
+	}
+
+	// Generate a new JWT for the client
+	newJWT, err := generateJWT(userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate new JWT"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"token": newJWT})
+}
+
+func oauthCallbackHandler(c *gin.Context) {
+	code := c.Query("code")
+	if code == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing authorization code"})
+		return
+	}
+
+	b, err := os.ReadFile("client_secret.json")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read client_secret.json"})
+		return
+	}
+
+	config, err := google.ConfigFromJSON(b, youtube.YoutubeScope)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse OAuth config"})
+		return
+	}
+
+	ctx := context.Background()
 	tok, err := config.Exchange(ctx, code)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to exchange code for token"})
 		return
 	}
 
-	saveToken("token.json", tok)
-	c.JSON(http.StatusOK, gin.H{"message": "Authorization successful"})
+	client := config.Client(ctx, tok)
+	service, err := youtube.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create YouTube service"})
+		return
+	}
+
+	call := service.Channels.List([]string{"snippet"}).Mine(true)
+	response, err := call.Do()
+	if err != nil || len(response.Items) == 0 {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve user information"})
+		return
+	}
+
+	userID := response.Items[0].Id
+	if err := saveTokenToFirestore(userID, tok); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save token"})
+		return
+	}
+
+	jwtToken, err := generateJWT(userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate JWT"})
+		return
+	}
+
+	redirectURL := fmt.Sprintf("http://localhost:5173/upload?token=%s", jwtToken)
+	c.Redirect(http.StatusFound, redirectURL)
+}
+
+func getAuthenticatedClient(userID string) (*http.Client, error) {
+	token, err := getTokenFromFirestore(userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve token: %v", err)
+	}
+
+	b, err := os.ReadFile("client_secret.json")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read client_secret.json: %v", err)
+	}
+
+	config, err := google.ConfigFromJSON(b, youtube.YoutubeScope)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse OAuth config: %v", err)
+	}
+
+	// Create a TokenSource that automatically handles renewal
+	tokenSource := config.TokenSource(context.Background(), token)
+	newToken, err := tokenSource.Token()
+	if err != nil {
+		return nil, fmt.Errorf("failed to refresh token: %v", err)
+	}
+
+	// If the token is refreshed, update Firestore
+	if newToken.AccessToken != token.AccessToken {
+		if err := saveTokenToFirestore(userID, newToken); err != nil {
+			return nil, fmt.Errorf("failed to update token in Firestore: %v", err)
+		}
+	}
+
+	// Return an authenticated client
+	return oauth2.NewClient(context.Background(), tokenSource), nil
+}
+
+func uploadHandler(c *gin.Context) {
+	var req UploadRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input", "details": err.Error()})
+		return
+	}
+
+	userID := c.GetString("user_id")
+	client, err := getAuthenticatedClient(userID)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated", "details": err.Error()})
+		return
+	}
+
+	service, err := youtube.NewService(context.Background(), option.WithHTTPClient(client))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create YouTube service"})
+		return
+	}
+
+	// Continue with the upload as before
+	videoPath := generateTempFileName()
+	if err := downloadVideo(req.VideoURL, videoPath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to download video", "details": err.Error()})
+		return
+	}
+	defer os.Remove(videoPath)
+
+	file, err := os.Open(videoPath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open video file", "details": err.Error()})
+		return
+	}
+	defer file.Close()
+
+	video := &youtube.Video{
+		Snippet: &youtube.VideoSnippet{
+			Title:       req.Title,
+			Description: req.Description,
+			Tags:        req.Tags,
+		},
+		Status: &youtube.VideoStatus{
+			PrivacyStatus: req.PrivacyStatus,
+		},
+	}
+
+	call := service.Videos.Insert([]string{"snippet", "status"}, video).Media(file)
+	_, err = call.Do()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to upload video", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Video uploaded successfully!"})
+}
+
+func generateJWT(userID string) (string, error) {
+	claims := jwt.MapClaims{
+		"user_id": userID,
+		"exp":     time.Now().Add(1 * time.Hour).Unix(),
+		"iat":     time.Now().Unix(),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtSecret)
+}
+
+func generateTempFileName() string {
+	return fmt.Sprintf("tmp_%d.mp4", time.Now().UnixNano())
 }
 
 func downloadVideo(videoURL, outputPath string) error {
 	resp, err := http.Get(videoURL)
 	if err != nil {
-		return fmt.Errorf("error making HTTP request: %v", err)
+		return fmt.Errorf("failed to download video: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("error downloading: status %d", resp.StatusCode)
+		return fmt.Errorf("failed to download video: HTTP status %d", resp.StatusCode)
 	}
 
 	file, err := os.Create(outputPath)
 	if err != nil {
-		return fmt.Errorf("error creating file: %v", err)
+		return fmt.Errorf("failed to create file: %v", err)
 	}
 	defer file.Close()
 
 	_, err = io.Copy(file, resp.Body)
 	if err != nil {
-		return fmt.Errorf("error writing file: %v", err)
-	}
-
-	fmt.Println("Download completed:", outputPath)
-	return nil
-}
-
-func uploadVideoWithProgress(service *youtube.Service, filePath, title, description string, tags []string, privacyStatus string) error {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return fmt.Errorf("error opening file: %v", err)
-	}
-	defer file.Close()
-
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("error getting file info: %v", err)
-	}
-	fileSize := fileInfo.Size()
-
-	video := &youtube.Video{
-		Snippet: &youtube.VideoSnippet{
-			Title:       title,
-			Description: description,
-			Tags:        tags,
-		},
-		Status: &youtube.VideoStatus{
-			PrivacyStatus: privacyStatus,
-		},
-	}
-
-	progressReader := &ProgressReader{
-		Reader: file,
-		Total:  fileSize,
-	}
-	progressReader.Start()
-
-	call := service.Videos.Insert([]string{"snippet", "status"}, video)
-	call = call.Media(progressReader)
-
-	_, err = call.Do()
-	progressReader.Stop()
-	if err != nil {
-		return fmt.Errorf("error uploading video: %v", err)
+		return fmt.Errorf("failed to save video: %v", err)
 	}
 
 	return nil
 }
 
-func getClient(ctx context.Context, config *oauth2.Config) *http.Client {
-	tokFile := "token.json"
-	tok, err := tokenFromFile(tokFile)
-	if err != nil {
-		tok = nil
-	}
-	return config.Client(ctx, tok)
+func saveTokenToFirestore(userID string, token *oauth2.Token) error {
+	_, err := firebaseApp.Collection("tokens").Doc(userID).Set(context.Background(), map[string]interface{}{
+		"access_token":  token.AccessToken,
+		"refresh_token": token.RefreshToken,
+		"expiry":        token.Expiry,
+	})
+	return err
 }
 
-func tokenFromFile(file string) (*oauth2.Token, error) {
-	f, err := os.Open(file)
+func getTokenFromFirestore(userID string) (*oauth2.Token, error) {
+	doc, err := firebaseApp.Collection("tokens").Doc(userID).Get(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	tok := &oauth2.Token{}
-	err = json.NewDecoder(f).Decode(tok)
-	return tok, err
+
+	data := doc.Data()
+	return &oauth2.Token{
+		AccessToken:  data["access_token"].(string),
+		RefreshToken: data["refresh_token"].(string),
+		Expiry:       data["expiry"].(time.Time),
+	}, nil
 }
 
-func saveToken(path string, token *oauth2.Token) {
-	fmt.Printf("Saving token to %s\n", path)
-	f, err := os.Create(path)
-	if err != nil {
-		log.Fatalf("error saving token: %v", err)
+func authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header missing or invalid"})
+			c.Abort()
+			return
+		}
+
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return jwtSecret, nil
+		})
+
+		if err != nil || !token.Valid {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			c.Abort()
+			return
+		}
+
+		claims, ok := token.Claims.(jwt.MapClaims)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims"})
+			c.Abort()
+			return
+		}
+
+		// Check if the JWT is expired
+		exp := int64(claims["exp"].(float64))
+		if time.Now().Unix() > exp {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "JWT expired"})
+			c.Abort()
+			return
+		}
+
+		c.Set("user_id", claims["user_id"])
+		c.Next()
 	}
-	defer f.Close()
-	json.NewEncoder(f).Encode(token)
 }
